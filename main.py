@@ -1,272 +1,115 @@
+"""
+Bot Discord principal.
+Ce script est le point d'entrée du bot Discord.
+"""
 import discord
-from discord import Option, Embed, Colour, Intents, Game
-from discord.ext import commands, tasks
-from json import load as json_load
-from time import time
-from random import choice as rchoice, randint
-from datetime import datetime
-from logging import Logger
-from logging.config import dictConfig as logging_dict_config
-from logging import getLogger
+from discord.ext import commands
+import asyncio
+import logging
+import config  # Votre config.py qui charge config.json
 
-from module import load_directory
-from cog import cogs
+# Configuration du logging de base pour le bot
+logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
+discord_logger = logging.getLogger('discord')
+discord_logger.setLevel(logging.WARNING) # Réduire le bruit de discord.py, mettre INFO pour plus de détails
+logger = logging.getLogger('main')
+logger.setLevel(logging.INFO)
 
-with open("logging.json", "r") as f:
-  logging_dict_config(json_load(f))
-  
-logger = getLogger()
+# Vérifier si le token est chargé
+if not config.token:
+    logger.critical("ERREUR CRITIQUE: Le token du bot n'est pas défini dans config.py ou config.json.")
+    exit()
 
-config = json_load(open("config.json", "r"))
-start = int(time())
-version = "0.0.0"
-
-intents: Intents = Intents.all()
-bot: commands.Bot = commands.Bot(intents = intents)
-bot.remove_command("help")
-
-cogs["kwargs"] = {"bot": bot}
-load_directory("cogs")
-
-
-def create_embed(title: str, description: str, author: str, color: Colour):
-    embed = Embed(title=title, description=description, colour=color)
-    embed.set_footer(text=f"Informations demandées par: {author}")
-    return embed
-
-@tasks.loop(minutes=10)
-async def change_activity():
-    bot.changeable_activites = [f"être sur {len(bot.guilds)} serveurs", f"regarde la version {version}", "regarder Start from Scratch", "Apex Legends", "Minecraft", "regarder netflix avec Katsuki", "regarder loyds44", "coder", "discuter avec des utilisateurs", "écouter de la musique", "aider les utilisateurs", "analyser des données", "apprendre de nouvelles choses", "aller à la salle", "se rappeler de scratch on scratch", "écouter de la hardbass", "quelquechose avec quelqu'un"]
-    await bot.wait_until_ready()
-    await bot.change_presence(activity=Game(rchoice(bot.changeable_activites))) 
+# Créer un bot avec tous les intents (ajustez si nécessaire pour la production)
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix=config.config.get("prefix", "!"), # Utiliser un préfixe de config.json ou défaut
+                   intents=intents,
+                   help_command=None) # help_command=None car nous avons une commande /help personnalisée
 
 @bot.event
-async def on_ready() -> None:
-  logger.info(f"Logged in as {bot.user.name}.")
+async def on_ready():
+    logger.info(f"Bot connecté en tant que {bot.user.name} (ID: {bot.user.id})")
+    logger.info(f"Préfixe des commandes (pour les commandes texte si utilisées): {bot.command_prefix}")
+    logger.info(f"Nombre de serveurs: {len(bot.guilds)}")
 
-  for channel_id in config["status_channel_ids"]:
-    await bot.get_channel(channel_id).send(f"Le bot est connecté en tant que {bot.user.mention} :green_circle:")
+    loaded_cogs = list(bot.cogs.keys())
+    logger.info(f"Cogs chargés ({len(loaded_cogs)}): {', '.join(loaded_cogs)}")
 
-  change_activity.start()
+    # Synchronisation des commandes slash après la connexion du bot
+    logger.info("Synchronisation des commandes slash globales...")
+    try:
+        # Synchroniser les commandes globales.
+        # Pour synchroniser pour une guilde spécifique: await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        synced = await bot.tree.sync()
+        logger.info(f"Synchronisé {len(synced)} commandes slash globales.")
+        for cmd in synced:
+            logger.debug(f"  - Commande synchronisée: /{cmd.name} (ID: {cmd.id})")
+    except discord.errors.Forbidden as e:
+        logger.error(f"Erreur de synchronisation des commandes slash: Accès interdit (Forbidden). Assurez-vous que le bot a la permission 'applications.commands'. Erreur: {e}")
+    except discord.app_commands.CommandSyncFailure as e:
+         logger.error(f"Échec de la synchronisation de certaines commandes slash. Commandes échouées: {e.failed_commands}")
+         logger.exception("Trace complète de l'erreur de synchronisation:")
+    except Exception as e:
+        logger.error(f"Erreur inattendue lors de la synchronisation des commandes slash: {type(e).__name__} - {e}")
+        logger.exception("Trace complète de l'erreur de synchronisation:")
 
-@bot.slash_command(
-  name = "say",
-  description = "Fais dire quelque chose au bot. (admin only)"
-)
-@commands.has_permissions(administrator = True)
-async def say(ctx, message: Option(str)) -> None:
-  await ctx.delete()
-  await ctx.channel.send(message)
+# Fonction asynchrone pour charger les cogs
+async def load_all_cogs():
+    logger.info("Début du chargement des cogs...")
+    loaded_cogs_list = []
+    for cog_name in config.cogs:
+        try:
+            await bot.load_extension(cog_name)
+            logger.info(f"Cog chargé avec succès: {cog_name}")
+            # Le nom réel du cog (nom de la classe) peut être différent du nom du fichier/module
+            # Pour obtenir le nom de la classe, il faudrait introspecter bot.cogs après le chargement
+        except commands.ExtensionNotFound:
+            logger.error(f"Erreur de chargement: Cog {cog_name} non trouvé (fichier manquant ou faute de frappe).")
+        except commands.ExtensionAlreadyLoaded:
+            logger.warning(f"Avertissement: Cog {cog_name} déjà chargé.")
+        except commands.NoEntryPointError:
+            logger.error(f"Erreur de chargement: Cog {cog_name} n'a pas de fonction setup().")
+        except commands.ExtensionFailed as e:
+            # L'exception originale est dans e.__cause__
+            original_exception = e.__cause__ if e.__cause__ else e
+            logger.error(f"Erreur de chargement: Cog {cog_name} a échoué. Erreur originale: {type(original_exception).__name__}: {original_exception}")
+            logger.exception(f"Trace complète de l'échec du chargement du cog {cog_name}:") # Loggue la stacktrace
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors du chargement du cog {cog_name}: {type(e).__name__} - {e}")
+            logger.exception("Trace complète de l'erreur de chargement du cog:")
 
-@bot.slash_command(
-  name = "dm",
-  description = "Envoie un DM à un utilisateur. (admin only)"
-)
-@commands.has_permissions(administrator = True)
-async def dm(ctx, member: Option(discord.Member, description="Mentionne le membre"), message: Option(str, description="Message a envoyer en privé")) -> None:
-  await ctx.delete()
-  embed= Embed(title="Nouveau message", description=message,colour=0x093156)
-  embed.set_footer(text=f"Message envoyé a partir du serveur {ctx.guild.name}")
-  await member.send(embed=embed)
-
-@bot.slash_command(
-    name = "infos",
-    description = "Avoir des informations sur le bot" 
-)
-async def infos(ctx):
-    embed = Embed(title="Infos",description=f"Information sur le bot {bot.user.mention}", colour= 0x008FFF)
-    embed.add_field(name="Données", value=f"Le ping du bot {bot.user.mention} est de {int(bot.latency * 1000)}ms \n A été lancé le <t:{start}:F> (<t:{start}:R>)", inline=False)
-    embed.add_field(name="Serveurs", value=f"Actuellement dans {len(bot.guilds)} serveur(s) \n Regarde {sum(guild.member_count for guild in bot.guilds)} membre(s)", inline=False)
-    embed.set_footer(text=f"Crée par Loyds44 & Switchcodeur , Version {version}")  #ligne a changé si pas les memes personnes qui ont fait le bots
-    await ctx.respond(embed=embed)
-
-@bot.slash_command(
-    name = "ping",
-    description = "Avoir le ping du bot" 
-)
-async def ping(ctx) -> None:
-    embed = create_embed("Ping", f"Le ping du bot {bot.user.mention} est de {int(bot.latency * 1000)}ms", ctx.author.name, 0xFFA900)
-    await ctx.respond(embed=embed)
-
-@bot.slash_command(
-    name= "embed",
-    description="Crée un embed" 
-)
-async def embed(
-  ctx, 
-  titre: Option(str), 
-  description: Option(str),
-) -> None:
-  embed = create_embed(titre, description, ctx.author.name,0x093156)
-  await ctx.respond(embed=embed)
-
-@bot.slash_command(
-  name= "tirage_de_des",
-  description="Faire un lancer de dés" 
-)
-async def tiragedes(
-    ctx, 
-    valeur1: Option(int, description="Valeur minimale"),
-    valeur2: Option(int, description="Valeur maximale"),
-    tirage: Option(int, description="Nombre de lancers")
-) -> None:
-    embed = Embed(
-        title="Lancer de dés",
-        description=f"Tirage de {tirage} dés compris entre {valeur1} et {valeur2}.",
-        color=Colour.green()
-    )
-    if valeur1 < valeur2 : 
-      for x in range(int(tirage)):
-          embed.add_field(
-              name=f"Tirage n°{x+1}", 
-              value=str(randint(valeur1, valeur2)), 
-              inline=True
-          )
-      await ctx.respond(embed=embed)
-    else: 
-      await ctx.respond(f"La valeur 1 ({valeur1}) ne peut pas etre inferieur à la valeur 2 ({valeur2})")
-
-@bot.slash_command(
-  name = "help",
-  description = "Liste des commandes disponibles" 
-)
-async def help(ctx) -> None:
-  embed = Embed(description = "Liste des commandes disponibles", timestamp = datetime.now())
-  embed.set_author(name = bot.user.display_name, icon_url = bot.user.display_avatar)
-  embed.add_field(name="Ressources",value = "[Serveur support]()",inline=False)
-  embed.add_field( name = "Commandes", value = "\n".join([f"`{command.name}` - {command.description}" for command in list(bot.all_commands.values())[1:]]), inline= False)
-
-  await ctx.respond(embed = embed)
-
-@bot.slash_command(
-  name= "serveur",
-  description="Avoir des informations sur le serveur" 
-)
-async def serveur(ctx) -> None:
-
-#limite le nbr de roles affiche :
-  if len(ctx.guild.roles) >= 36:
-    nbr_role = int(len(ctx.guild.roles))-35
-    roles_list = ", ".join((role.mention for role in list(reversed(ctx.guild.roles[nbr_role:]))))
-    roles_list += f" **et {nbr_role-1} rôles en plus**" 
-  else :
-    roles_list = ", ".join((role.mention for role in list(reversed(ctx.guild.roles[1:]))))
-  
-  #creation embed :
-  embed = create_embed(ctx.guild.name, f"Information sur le serveur {ctx.guild.name} (`{ctx.guild.id}`)", ctx.author.name, 0x1DB747)
-  embed.add_field(name="Création du serveur:", value=f"<t:{int(ctx.guild.created_at.timestamp())}:F>", inline = True)
-  embed.add_field(name="Proprietaire:", value=f"{ctx.guild.owner.mention} (`{ctx.guild.owner.id}`)", inline = True)
-  embed.add_field(name=f"{len(ctx.guild.roles)-1} rôles:", value=roles_list, inline = False) #le -1 permet de ne pas prendre en compte everyone ds le compte
-  embed.add_field(name="Statistiques:",value=f"Nombre de membres: {ctx.guild.member_count} \n Nombre de salons textuels: {len(ctx.guild.text_channels)} \n Nombre de salons vocaux: {len(ctx.guild.voice_channels)}", inline = False) #bot.all_commands.values()[1:] pour ne plus avoir l'affiche de "module"
-  await ctx.respond(embed=embed)
-
-@bot.slash_command(
-  name = "membre",
-  description = "Avoir des informations sur un membre " 
-)
-async def membre(ctx, member: Option(discord.Member, description="Mentionne le membre")) -> None:
- 
- #limite le nbr de roles affiche :
-  if len(member.roles) >= 11:
-    nbr_role = int(len(member.roles))-10 
-    role_names = ", ".join((role.mention for role in list(reversed(member.roles[nbr_role:])))) # Permet d'avoir tous les rôles sauf everyone = ", ".join((role.mention for role in list(reversed((member.roles[nbr_role:]))))
-    role_names += f" **et {nbr_role-1} rôles en plus**" 
-  else :
-   role_names = ", ".join([role.mention for role in list(reversed(member.roles[1:]))]) # Permet d'avoir tous les rôles sauf everyone = ", ".join([role.mention for role in list(reversed(member.roles[1:]))]) # Permet d'avoir tous les rôles sauf everyone
-
-#badges de "status" :
-  emoji = ""
-  if member.id == ctx.guild.owner.id:
-    emoji += ":crown:" #couronne - <:owner_badge:1262777459242172506>
-  if any(role.permissions.administrator for role in member.roles) :
-    emoji += ":shield:"
-  if member.bot:
-    emoji += ":robot:"
-  if member.id in config["dev_id"] :
-    emoji += ":tools:"
-  if not emoji :
-    emoji = ":bust_in_silhouette:"
-  
-# Définir l'URL de l'avatar, ou utiliser l'avatar par défaut si None
-  avatar_url = member.avatar.url if member.avatar else member.default_avatar.url
-
-#affichage des badges (nitro,maison....)
-  emoji_badges = {
-    "hypesquad_balance": "<:discord_balance:1262774434008399892>",
-    "hypesquad_bravery": "<:discord_bravery:1262774436193505411>",
-    "hypesquad_brilliance": "<:discord_brillance:1262774437187424278>",
-    "active_developer": "<:developpeur_badge:1262777455609909361>" 
-    }
-  
-  if not member.public_flags.all() : 
-    badges_names ="_Aucun Badges_"
-  else : 
-    badges_names = ", ".join([emoji_badges.get(flag.name, flag.name) for flag in list(member.public_flags.all())])
+    # Afficher les noms de classe des cogs réellement chargés
+    actual_loaded_cogs = list(bot.cogs.keys())
+    logger.info(f"Chargement des cogs terminé. {len(actual_loaded_cogs)} cogs réellement dans bot.cogs: {', '.join(actual_loaded_cogs)}")
 
 
-#creation embed :
-  embed = create_embed(None, f"Informations sur le membre {member.mention} {emoji} (`{member.id}`)", ctx.author.name, 0x0193C6)
-  embed.set_author(name=member.display_name, icon_url=avatar_url)
-  embed.add_field(name="Création du compte :", value=f"<t:{int(member.created_at.timestamp())}:F>", inline=True)
-  embed.add_field(name="A rejoint le serveur le :", value=f"<t:{int(member.joined_at.timestamp())}:F>", inline=True)
-  embed.add_field(name=f"{len(member.roles)-1} rôles :", value=role_names, inline=False) # -1 car on ne compte pas everyone dans les rôles
-  embed.add_field(name=f"Badges", value=badges_names, inline=False)
-  embed.set_thumbnail(url=avatar_url)
-  await ctx.respond(embed=embed)
+# Fonction principale asynchrone
+async def main():
+    """Fonction principale asynchrone."""
+    # Assigner owner_id/owner_ids pour @app_commands.checks.is_owner()
+    if config.dev_id:
+        if isinstance(config.dev_id, list) and len(config.dev_id) > 0 :
+            bot.owner_ids = set(int(id_str) for id_str in config.dev_id) # Assurez-vous que les IDs sont des int
+            logger.info(f"Propriétaires du bot (owner_ids) définis sur : {bot.owner_ids}")
+        elif isinstance(config.dev_id, (str, int)): # Si c'est un seul ID
+             bot.owner_id = int(config.dev_id)
+             logger.info(f"Propriétaire du bot (owner_id) défini sur : {bot.owner_id}")
+        else:
+            logger.warning("dev_id dans config.json n'est pas dans un format attendu (liste d'IDs ou ID unique). @is_owner pourrait ne pas fonctionner.")
+    else:
+        logger.warning("Aucun dev_id trouvé dans config.json. @is_owner se basera sur le propriétaire de l'application Discord.")
 
-@bot.slash_command(
-name = "avatar",
-description = "Avoir la photo de profil d'un membre" 
-)
-async def avatar(ctx, member: Option(discord.Member, description="Mentionne le membre")) -> None:
+    async with bot:
+        await load_all_cogs()
 
-  avatar_url = member.avatar.url if member.avatar else member.default_avatar.url # Définir l'URL de l'avatar, ou utiliser l'avatar par défaut si None
+        # La synchronisation des commandes slash est maintenant gérée dans l'événement on_ready
+        # après que le bot soit complètement connecté
 
-  embed = Embed(title=f"Avatar de {member.display_name}",url= avatar_url)
-  embed.set_image(url=avatar_url)
-  await ctx.respond(embed=embed)
+        await bot.start(config.token)
 
-
-@bot.slash_command(
-  name = "role",
-  description = "Avoir des informations sur un rôle" 
-)
-async def role(ctx, role: Option(discord.Role, description="Mentionne le role")) -> None:
-  liste_membre = ", ".join(member.mention for member in role.members[:10])
-  if len(role.members) >= 10:
-    liste_membre += f" **et {int(len(role.members))-10} membres en plus**" 
-  embed = create_embed(None, f"Informations sur le rôle {role.mention} (`{role.id}`)", ctx.author.name, role.color)
-  embed.add_field(name="Création du rôle:", value=f"<t:{int(role.created_at.timestamp())}:F>", inline=True)
-  embed.add_field(name= f"{len(role.members)} Membres: ", value= liste_membre, inline= False)
-  await ctx.respond(embed=embed)
-
-@bot.slash_command(
-  name = "emoji",
-  description = "Avoir des informations sur un emoji" 
-)
-async def emoji(ctx, emoji: Option(discord.Emoji, description="Mentionne l'emoji")) -> None:
-
-  embed = create_embed(None, f"Informations sur l'emoji '{emoji.name}' (`{emoji.id}`)", ctx.author.name, 0xE47703)
-  embed.set_author(name=emoji.name, icon_url=emoji.url)
-  embed.add_field(name="Création de l'emoji:", value=f"<t:{int(emoji.created_at.timestamp())}:F>", inline=True)
-  embed.add_field(name="Tag:", value=f"`<:{emoji.name}:{emoji.id}>`", inline=True)
-  embed.set_thumbnail(url=emoji.url)
-  await ctx.respond(embed=embed)
-
-
-@bot.slash_command(
-  name = "liste_serveurs",
-  description = "Avoir la liste des serveurs du bot. (dev only)" 
-)
-async def liste_serveurs(ctx) -> None:
-  if ctx.author.id in config["dev_id"] :
-    embed = Embed(title='', description=f"liste des serveurs du bot {bot.user.name}", colour=0x0A3D7D)
-    embed.add_field(name=f"{len(bot.guilds)} Serveurs :", value= " \n ".join([guild.name for guild in bot.guilds]), inline=True)
-    embed.add_field(name="ID :", value= " \n ".join([str(guild.id) for guild in bot.guilds]), inline=True)
-    embed.add_field(name="Membres :", value= " \n ".join([str(guild.member_count) for guild in bot.guilds]), inline=True)
-    await ctx.respond(embed=embed)
-  else : 
-    await ctx.respond("Vous n'etes pas un developpeur du bot, vous ne pouvez donc pas effectuer cette commande")
-
-
-bot.run(config["token"])
+# Démarrer le bot
+if __name__ == "__main__":
+    # Créer le dossier cogs s'il n'existe pas (au cas où, bien que les fichiers soient déjà là)
+    # if not os.path.exists("cogs"):
+    #     os.makedirs("cogs")
+    asyncio.run(main())
